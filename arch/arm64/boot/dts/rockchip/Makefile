@@ -149,6 +149,7 @@ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-toybrick-x0-android.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-toybrick-x0-linux.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-vehicle-evb-v10.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-zaku2.dtb
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-zaku2-v1.0.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-zaku2-v1.1.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb1-lp4x-v10.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-evb1-lp4x-v10-linux.dtb
