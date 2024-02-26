@@ -61,6 +61,8 @@
 		regulator-min-microvolt = <3300000>;
 		regulator-max-microvolt = <3300000>;
 		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
 		gpios = <&gpio1 RK_PB7 GPIO_ACTIVE_HIGH>;
 		startup-delay-us = <5000>;
 		vin-supply = <&vcc5v0_sys>;
@@ -72,6 +74,8 @@
 		regulator-min-microvolt = <3300000>;
 		regulator-max-microvolt = <3300000>;
 		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
 		gpios = <&gpio1 RK_PD2 GPIO_ACTIVE_HIGH>;
 		startup-delay-us = <50000>;
 		vin-supply = <&vcc5v0_sys>;
@@ -83,6 +87,8 @@
 		regulator-min-microvolt = <3300000>;
 		regulator-max-microvolt = <3300000>;
 		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
 		gpios = <&gpio1 RK_PA4 GPIO_ACTIVE_HIGH>;
 		startup-delay-us = <5000>;
 		vin-supply = <&vcc5v0_sys>;
