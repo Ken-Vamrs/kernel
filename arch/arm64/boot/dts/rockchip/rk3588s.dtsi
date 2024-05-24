@@ -2974,7 +2974,7 @@
 		status = "disabled";
 	};
 
-	gpu_panthor: gpu-panthor@fb000000 {
+	gpu: gpu@fb000000 {
 		compatible = "rockchip,rk3588-mali", "arm,mali-valhall-csf";
 		reg = <0x0 0xfb000000 0x0 0x200000>;
 		#cooling-cells = <2>;
