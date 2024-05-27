@@ -25,6 +25,72 @@
 		usbdp1 = &usbdp_phy1;
 	};
 
+	system {
+		cpu,model = "Rockchip RK3588";
+	};
+
+	rkcif_mipi_lvds4: rkcif-mipi-lvds4 {
+		compatible = "rockchip,rkcif-mipi-lvds";
+		rockchip,hw = <&rkcif>;
+		iommus = <&rkcif_mmu>;
+		status = "disabled";
+	};
+
+	rkcif_mipi_lvds4_sditf: rkcif-mipi-lvds4-sditf {
+		compatible = "rockchip,rkcif-sditf";
+		rockchip,cif = <&rkcif_mipi_lvds4>;
+		status = "disabled";
+	};
+
+	rkcif_mipi_lvds4_sditf_vir1: rkcif-mipi-lvds4-sditf-vir1 {
+		compatible = "rockchip,rkcif-sditf";
+		rockchip,cif = <&rkcif_mipi_lvds4>;
+		status = "disabled";
+	};
+
+	rkcif_mipi_lvds4_sditf_vir2: rkcif-mipi-lvds4-sditf-vir2 {
+		compatible = "rockchip,rkcif-sditf";
+		rockchip,cif = <&rkcif_mipi_lvds4>;
+		status = "disabled";
+	};
+
+	rkcif_mipi_lvds4_sditf_vir3: rkcif-mipi-lvds4-sditf-vir3 {
+		compatible = "rockchip,rkcif-sditf";
+		rockchip,cif = <&rkcif_mipi_lvds4>;
+		status = "disabled";
+	};
+
+	rkcif_mipi_lvds5: rkcif-mipi-lvds5 {
+		compatible = "rockchip,rkcif-mipi-lvds";
+		rockchip,hw = <&rkcif>;
+		iommus = <&rkcif_mmu>;
+		status = "disabled";
+	};
+
+	rkcif_mipi_lvds5_sditf: rkcif-mipi-lvds5-sditf {
+		compatible = "rockchip,rkcif-sditf";
+		rockchip,cif = <&rkcif_mipi_lvds5>;
+		status = "disabled";
+	};
+
+	rkcif_mipi_lvds5_sditf_vir1: rkcif-mipi-lvds5-sditf-vir1 {
+		compatible = "rockchip,rkcif-sditf";
+		rockchip,cif = <&rkcif_mipi_lvds5>;
+		status = "disabled";
+	};
+
+	rkcif_mipi_lvds5_sditf_vir2: rkcif-mipi-lvds5-sditf-vir2 {
+		compatible = "rockchip,rkcif-sditf";
+		rockchip,cif = <&rkcif_mipi_lvds5>;
+		status = "disabled";
+	};
+
+	rkcif_mipi_lvds5_sditf_vir3: rkcif-mipi-lvds5-sditf-vir3 {
+		compatible = "rockchip,rkcif-sditf";
+		rockchip,cif = <&rkcif_mipi_lvds5>;
+		status = "disabled";
+	};
+
 	usbdrd3_1: usbdrd3_1 {
 		compatible = "rockchip,rk3588-dwc3", "rockchip,rk3399-dwc3";
 		clocks = <&cru REF_CLK_USB3OTG1>, <&cru SUSPEND_CLK_USB3OTG1>,
