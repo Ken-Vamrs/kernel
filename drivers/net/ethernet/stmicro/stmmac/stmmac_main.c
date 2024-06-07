@@ -5013,6 +5013,25 @@ static int phy_rtl8211f_eee_fixup(struct phy_device *phydev)
 	return 0;
 }
 
+static int phy_8211fS_fiber_mode_fixup(struct phy_device *phydev)
+{	int i;
+	printk("%s in\n", __func__);
+	phy_write(phydev, 31, 0xdc0 );
+   phy_write(phydev, 16, 0x79ad );
+   //phy_write(phydev, 20, 0x79ad );
+	printk("page 0xdc0 register\n");
+	for(i =0; i<8;i++)
+		printk("%d: %x\n",i,phy_read(phydev,i));
+    phy_write(phydev, 31, 0xdc1 );
+   printk("23: %x\n", phy_read(phydev,23));
+   phy_write(phydev, 31, 0x0 );
+   printk("page 0 register\n");
+	for(i =0; i<32; i++)
+		printk("%d: %x\n",i,phy_read(phydev,i));
+
+	return 0;
+}
+
 /**
  * stmmac_dvr_probe
  * @device: device pointer
@@ -5274,6 +5293,10 @@ int stmmac_dvr_probe(struct device *device,
 	if (ret) {
 		dev_warn(priv->device, "Failed to register fixup for PHY RTL8211F disabling EEE.\n");
 	}
+
+	ret = phy_register_fixup_for_uid(RTL8211F_PHY_UID, 0xffffffff, phy_8211fS_fiber_mode_fixup);
+	if (ret)
+		pr_warn("Cannot register PHY board fixup.\n");
 
 	return ret;
 
