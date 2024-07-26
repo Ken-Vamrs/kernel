@@ -2812,20 +2812,10 @@ dw_hdmi_connector_detect(struct drm_connector *connector, bool force)
 			result = connector_status_disconnected;
 	}
 
-out:
-	if (result == connector_status_connected) {
-		extcon_set_state_sync(hdmi->extcon, EXTCON_DISP_HDMI, true);
-		handle_plugged_change(hdmi, true);
-	} else {
-		if (!hdmi->next_bridge) {
-			drm_connector_update_edid_property(&hdmi->connector, NULL);
-			list_for_each_entry(mode, &hdmi->connector.modes, head)
-				mode->status = MODE_STALE;
-			drm_mode_prune_invalid(hdmi->connector.dev, &hdmi->connector.modes, false);
-		}
-		extcon_set_state_sync(hdmi->extcon, EXTCON_DISP_HDMI, false);
-		handle_plugged_change(hdmi, false);
-	}
+	if (result == connector_status_connected)
+		hdmi->last_connector_result = connector_status_connected;
+	else
+		hdmi->last_connector_result = connector_status_disconnected;
 
 	return result;
 }
