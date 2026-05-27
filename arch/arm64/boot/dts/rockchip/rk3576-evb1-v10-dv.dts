@@ -73,12 +73,12 @@
 	status = "okay";
 };
 
-&chosen {
-	bootargs = "earlycon=uart8250,mmio32,0x2ad40000 console=ttyFIQ0 \
-		   ubi.mtd=3 root=ubi0:rootfs rootfstype=ubifs rw rootwait \
-		   rcupdate.rcu_expedited=1 rcu_nocbs=all isolcpus=3 nohz_full=3 \
-		   snd_aloop.index=7 snd_aloop.use_raw_jiffies=1";
-};
+// &chosen {
+// 	bootargs = "earlycon=uart8250,mmio32,0x2ad40000 console=ttyFIQ0 \
+// 		   ubi.mtd=3 root=ubi0:rootfs rootfstype=ubifs rw rootwait \
+// 		   rcupdate.rcu_expedited=1 rcu_nocbs=all isolcpus=3 nohz_full=3 \
+// 		   snd_aloop.index=7 snd_aloop.use_raw_jiffies=1";
+// };
 
 &CPU_SLEEP {
 	status = "disabled";

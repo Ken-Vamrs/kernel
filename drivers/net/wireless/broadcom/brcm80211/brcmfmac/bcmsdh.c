@@ -1313,7 +1313,7 @@ static int brcmf_ops_sdio_suspend(struct device *dev)
 
 	sdiodev = bus_if->bus_priv.sdio;
 
-	if (sdiodev->wowl_enabled || !cap_power_off) {
+	if (sdiodev->wowl_enabled || !pm_power_off) {
 		brcmf_sdiod_freezer_on(sdiodev);
 		brcmf_sdio_wd_timer(sdiodev->bus, 0);
 
