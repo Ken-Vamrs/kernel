@@ -1,0 +1,96 @@
+GT9886 Driver Modifications for SCG
+=====================================
+
+Date: 2025-10-31
+
+## Summary
+Modified GT9886 touchscreen driver (from Xiaomi MT6785 kernel) to work without the
+missing gt9886_cfg_v1.bin configuration file by hardcoding register addresses from
+the official GT9886 Programming Guide V0.1.
+
+
+## Changes Made
+
+### 1. goodix_cfg_bin.c - Added Surrogate Config Package (lines 23-57)
+   - Created static `gt9886_surrogate_cfg` structure with hardcoded register addresses
+   - Register addresses sourced from GT9886&GT9885 Programming Guide V0.1 (Chinese manual)
+   - Set ic_type = "nanjing" (GT9886 is nanjing family chip)
+   - Set cfg_type = TS_NORMAL_CFG (0x01)
+
+   Register Address Map (from Programming Guide):
+   - version_base: 0x4532 (4 bytes) - page 5 (was TS_REG_VERSION 0x8240)
+   - pid: 0x4535 (6 bytes) - page 5 (was TS_REG_PID 0x4535 - MATCHES!)
+   - sensor_id: 0x0000 (skip check) - page 5 has 0x4541 but we skip validation
+   - fw_status: 0x6F6F - page 6
+   - cfg_addr: 0x0000 (unknown, was TS_REG_CFG_BASE 0x8050)
+   - esd: 0x3103 - page 8 (was TS_REG_ESD_TICK_R 0x3103 - MATCHES!)
+   - command: 0x6F68 - page 6 (was TS_REG_CMD 0x8040)
+   - coor: 0x4100 - page 4 (was TS_REG_COORDS_BASE 0x824E)
+   - fw_request: 0x6F6D - page 6 (was TS_REG_REQUEST 0x8044)
+
+   Unknown registers set to 0x0000:
+   - cfg_send_flag, vid, fw_mask, gesture, proximity
+
+   Note: Only 2 out of 9 original stock TS_REG defines matched Programming Guide
+
+   Config data (.cfg field) set to NULL - chip should use factory defaults
+
+### 2. goodix_cfg_bin.c - Modified goodix_cfg_bin_proc() (lines 253-275)
+   - When goodix_read_cfg_bin() fails (file not found):
+     * Allocate memory for one package
+     * Copy surrogate package into cfg_bin->cfg_pkgs[0]
+     * Set cfg_bin->head.pkg_num = 1
+     * Skip binary parsing step
+     * Continue to goodix_get_reg_and_cfg() which processes surrogate as if loaded
+   - Logs: "Loaded surrogate config package with Programming Guide register addresses"
+   - Graceful fallback - rest of driver thinks config was loaded normally
+
+### 3. goodix_ts_i2c.c - Fixed Hardcoded Register Addresses (lines 1377, 1388, 1399, 2174)
+   - Driver had hardcoded register address 0x8040 (old TS_REG_CMD value)
+   - GT9886 uses different command register address: 0x6F68 (from Programming Guide)
+   - Changed hardcoded references to use ts_dev->reg.command instead
+   - Allows driver to work with correct register map from surrogate config
+   - Note: If issues arise, can revert command address back to 0x8040 in surrogate cfg
+
+### 4. Voltage Regulator Modification (details needed)
+   - Changed voltage regulator check to not require exactly 3V
+   - Fixed 3.3V supply compatibility
+   - (Location and specific changes TBD - add details when known)
+
+
+## Technical Notes
+
+### reserved1 and reserved2 in reg_info
+- reserved1 = LENGTH (bytes to read) for version_base, pid, vid
+- reserved1 = MASK (AND mask) for sensor_id comparison
+- reserved2 = unused
+
+### cnst_info vs reg_info
+- reg_info: Register ADDRESSES on I2C device (WHERE to read/write)
+- cnst_info: Expected VALUES (WHAT should be read for validation)
+- Original binary file contains both structures
+- Driver reads from reg_info addresses and validates against cnst_info values
+
+### Why This Works
+- GT9886 chip has factory defaults in ROM/flash
+- Config file (.cfg data) is optional tuning/customization
+- Register address map is REQUIRED for any communication
+- Chip should work with defaults, may need tuning later if touch response is off
+
+
+## Files Modified
+- goodix_cfg_bin.c - Added surrogate config structure and injection logic
+- goodix_ts_i2c.c - Fixed hardcoded 0x8040 register addresses to use ts_dev->reg.command (lines 1377, 1388, 1399, 2174)
+
+## Files Not Modified
+- goodix_cfg_bin.h (header unchanged)
+
+## References
+- GT9886&GT9885编程指南_V0.1(1).pdf (Programming Guide, Chinese)
+- Original driver source: Xiaomi MT6785 kernel (not Rockchip)
+
+## Testing Notes
+- Driver should load without "cfg_bin not available" error
+- Watch for "Loaded surrogate config package" message in dmesg
+- Touch detection should work (interrupts, coordinate reads)
+- If touch behaves oddly, may need to investigate .cfg data tuning later

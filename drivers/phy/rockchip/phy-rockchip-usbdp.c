@@ -182,6 +182,7 @@ struct rockchip_udphy {
 	bool dp_sink_hpd_sel;
 	bool dp_sink_hpd_cfg;
 	bool dp_hpd_disabled;
+	bool no_aux_polarity_invert;
 	u8 bw;
 	int id;
 	int dp_lanes;
@@ -644,8 +645,8 @@ static int udphy_set_typec_default_mapping(struct rockchip_udphy *udphy)
 		udphy->lane_mux_sel[1] = PHY_LANE_MUX_DP;
 		udphy->lane_mux_sel[2] = PHY_LANE_MUX_USB;
 		udphy->lane_mux_sel[3] = PHY_LANE_MUX_USB;
-		udphy->dp_aux_dout_sel = PHY_AUX_DP_DATA_POL_INVERT;
-		udphy->dp_aux_din_sel = PHY_AUX_DP_DATA_POL_INVERT;
+		udphy->dp_aux_dout_sel = udphy->no_aux_polarity_invert ? PHY_AUX_DP_DATA_POL_NORMAL : PHY_AUX_DP_DATA_POL_INVERT;
+		udphy->dp_aux_din_sel = udphy->no_aux_polarity_invert ? PHY_AUX_DP_DATA_POL_NORMAL : PHY_AUX_DP_DATA_POL_INVERT;
 		gpiod_set_value_cansleep(udphy->sbu1_dc_gpio, 1);
 		gpiod_set_value_cansleep(udphy->sbu2_dc_gpio, 0);
 	} else {
@@ -1558,6 +1559,9 @@ static int rockchip_udphy_probe(struct platform_device *pdev)
 	mutex_init(&udphy->mutex);
 	udphy->dev = dev;
 	platform_set_drvdata(pdev, udphy);
+
+	udphy->no_aux_polarity_invert =
+		device_property_read_bool(dev, "rockchip,no-aux-polarity-invert");
 
 	if (device_property_present(dev, "orientation-switch")) {
 		ret = udphy_setup_orien_switch(udphy);

@@ -29,6 +29,7 @@
 #include <linux/module.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
 #include <linux/rockchip-panel-notifier.h>
@@ -222,6 +223,14 @@ struct panel_simple {
 	struct rockchip_panel_notifier panel_notifier;
 };
 
+struct panel_desc_dsi {
+	struct panel_desc desc;
+
+	unsigned long flags;
+	enum mipi_dsi_pixel_format format;
+	unsigned int lanes;
+};
+
 static inline void panel_simple_msleep(unsigned int msecs)
 {
 	usleep_range(msecs * 1000, msecs * 1000 + 100);
@@ -231,6 +240,10 @@ static inline struct panel_simple *to_panel_simple(struct drm_panel *panel)
 {
 	return container_of(panel, struct panel_simple, base);
 }
+
+/* Forward declarations for RM67199 panel */
+static const struct panel_desc_dsi scg_rm67199;
+static int scg_rm67199_panel_init(struct mipi_dsi_device *dsi);
 
 static int panel_simple_parse_cmd_seq(struct device *dev,
 				      const u8 *data, int length,
@@ -592,15 +605,25 @@ static int panel_simple_unprepare(struct drm_panel *panel)
 	return 0;
 }
 
+
 static int panel_simple_prepare(struct drm_panel *panel)
 {
 	struct panel_simple *p = to_panel_simple(panel);
 	int err;
 
-	/* Preparing when already prepared is a no-op */
-	if (p->prepared)
-		return 0;
+	//dev_info(panel->dev, "*** panel_simple_prepare: CALLEDX\n");
 
+	/* Preparing when already prepared is a no-op */
+	if (p->prepared) {
+		//dev_info(panel->dev, "*** panel_simple_prepare: already prepared, returning\n");
+		return 0;
+	}
+
+	/* Pre-configure reset LOW before applying power (per datasheet requirement) */
+	//dev_info(panel->dev, "*** panel_simple_prepare: configuring reset LOW before power\n");
+	gpiod_direction_output(p->reset_gpio, 1);  /* ACTIVE_LOW: value=1 means LOW */
+
+	//dev_info(panel->dev, "*** panel_simple_prepare: enabling regulator\n");
 	err = panel_simple_regulator_enable(p);
 	if (err < 0) {
 		dev_err(panel->dev, "failed to enable supply: %d\n", err);
@@ -612,28 +635,47 @@ static int panel_simple_prepare(struct drm_panel *panel)
 	if (p->desc->delay.prepare)
 		panel_simple_msleep(p->desc->delay.prepare);
 
-	gpiod_direction_output(p->reset_gpio, 1);
+	/* Hold reset asserted for reset delay period */
+	//dev_info(panel->dev, "*** panel_simple_prepare: holding reset asserted\n");
 
 	if (p->desc->delay.reset)
 		panel_simple_msleep(p->desc->delay.reset);
 
-	gpiod_direction_output(p->reset_gpio, 0);
+	/* Release reset - panel will begin OTP loading */
+	//dev_info(panel->dev, "*** panel_simple_prepare: releasing reset\n");
+	gpiod_direction_output(p->reset_gpio, 0);  /* ACTIVE_LOW: value=0 means HIGH */
 
 	if (p->desc->delay.init)
 		panel_simple_msleep(p->desc->delay.init);
 
-	if (p->desc->init_seq) {
+	/* Check if this is the rm67199 panel - use new simple init function */
+	if (p->dsi && p->desc == &scg_rm67199.desc) {
+		dev_info(panel->dev, "*** panel_simple_prepare: calling rm67199 simple init\n");
+		err = scg_rm67199_panel_init(p->dsi);
+		if (err < 0) {
+			dev_err(panel->dev, "rm67199 init failed: %d\n", err);
+			return err;
+		}
+	} else if (p->desc->init_seq) {
+		//dev_info(panel->dev, "*** panel_simple_prepare: sending init sequence\n");
 		if (p->desc->cmd_type == CMD_TYPE_SPI) {
 			if (panel_simple_xfer_spi_cmd_seq(p, p->desc->init_seq)) {
 				dev_err(panel->dev, "failed to send init spi cmds seq\n");
 				return -EINVAL;
 			}
 		} else {
-			if (p->dsi)
+			if (p->dsi) {
+				dev_info(panel->dev, "*** panel_simple_prepare: sending DSI init commands\n");
 				panel_simple_xfer_dsi_cmd_seq(p, p->desc->init_seq);
+			}
 		}
 	}
 
+	/* Test DSI communication after init commands */
+	//dev_info(panel->dev, "*** panel_simple_prepare: testing DSI after init\n");
+	//panel_simple_test_dsi_communication(p);
+
+	//dev_info(panel->dev, "*** panel_simple_prepare: prepare complete\n");
 	p->prepared = true;
 
 	return 0;
@@ -642,13 +684,18 @@ static int panel_simple_prepare(struct drm_panel *panel)
 static int panel_simple_enable(struct drm_panel *panel)
 {
 	struct panel_simple *p = to_panel_simple(panel);
+	dev_info(panel->dev, "*** VERSION VERIFY ZYZ222 \n");
+	dev_info(panel->dev, "*** panel_simple_enable: CALLEDZZ\n");
 
-	if (p->enabled)
+	if (p->enabled) {
+		dev_info(panel->dev, "*** panel_simple_enable: already enabled, returning\n");
 		return 0;
+	}
 
 	if (p->desc->delay.enable)
 		panel_simple_msleep(p->desc->delay.enable);
 
+	dev_info(panel->dev, "*** panel_simple_enable: enable complete\n");
 	p->enabled = true;
 
 	/*
@@ -667,8 +714,11 @@ static int panel_simple_get_modes(struct drm_panel *panel,
 	struct panel_simple *p = to_panel_simple(panel);
 	int num = 0;
 
+	dev_info(panel->dev, "*** panel_simple_get_modes: CALLEDY\n");
+
 	/* probe EDID if a DDC bus is available */
 	if (p->ddc) {
+		dev_info(panel->dev, "*** panel_simple_get_modes: checking DDC\n");
 		if (!p->edid)
 			p->edid = drm_get_edid(connector, p->ddc);
 
@@ -676,8 +726,11 @@ static int panel_simple_get_modes(struct drm_panel *panel,
 			num += drm_add_edid_modes(connector, p->edid);
 	}
 
+	dev_info(panel->dev, "*** panel_simple_get_modes: calling panel_simple_get_non_edid_modes\n");
 	/* add hard-coded panel modes */
 	num += panel_simple_get_non_edid_modes(p, connector);
+
+	dev_info(panel->dev, "*** panel_simple_get_modes: returning %d modes\n", num);
 
 	/*
 	 * TODO: Remove once all drm drivers call
@@ -828,9 +881,17 @@ static int dcs_bl_update_status(struct backlight_device *bl)
 
 	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
 
-	ret = mipi_dsi_dcs_set_display_brightness(dsi, bl->props.brightness);
-	if (ret < 0)
-		return ret;
+	ret = mipi_dsi_generic_write(dsi, (u8[]){0xFE, 0x60}, 2); //page 60 
+	ret = mipi_dsi_generic_write(dsi, (u8[]){0x67, 0x80}, 2); //enable brightness ctl
+	ret = mipi_dsi_generic_write(dsi, (u8[]){0xFE, 0x00}, 2); //page 00 
+	ret = mipi_dsi_generic_write(dsi, (u8[]){0x51, bl->props.brightness}, 2); //set brightness 0-255
+	ret = mipi_dsi_generic_write(dsi, (u8[]){0x53, 0x20}, 2); //enable brightness make it so
+
+
+	//ret = mipi_dsi_dcs_set_display_brightness(dsi, bl->props.brightness);
+	//if (ret < 0)
+	//	return ret;
+
 
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
@@ -839,23 +900,8 @@ static int dcs_bl_update_status(struct backlight_device *bl)
 
 static int dcs_bl_get_brightness(struct backlight_device *bl)
 {
-	struct panel_simple *p = bl_get_data(bl);
-	struct mipi_dsi_device *dsi = p->dsi;
-	u16 brightness = bl->props.brightness;
-	int ret;
-
-	if (!p->prepared)
-		return 0;
-
-	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
-
-	ret = mipi_dsi_dcs_get_display_brightness(dsi, &brightness);
-	if (ret < 0)
-		return ret;
-
-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
-
-	return brightness & 0xff;
+	// Panel doesn't support reading brightness - return cached value
+	return bl->props.brightness;
 }
 
 static const struct backlight_ops dcs_bl_ops = {
@@ -872,6 +918,8 @@ static int panel_simple_probe(struct device *dev, const struct panel_desc *desc)
 	u32 bus_flags;
 	int err;
 
+	dev_info(dev, "panel_simple_probe: starting\n");
+
 	panel = devm_kzalloc(dev, sizeof(*panel), GFP_KERNEL);
 	if (!panel)
 		return -ENOMEM;
@@ -880,12 +928,14 @@ static int panel_simple_probe(struct device *dev, const struct panel_desc *desc)
 	panel->prepared_time = 0;
 	panel->desc = desc;
 
+	dev_info(dev, "panel_simple_probe: requesting power regulator\n");
 	panel->supply = devm_regulator_get(dev, "power");
 	if (IS_ERR(panel->supply)) {
 		err = PTR_ERR(panel->supply);
-		dev_err(dev, "failed to get power regulator: %d\n", err);
+		dev_err(dev, "panel_simple_probe: failed to get power regulator: %d\n", err);
 		return err;
 	}
+	dev_info(dev, "panel_simple_probe: power regulator obtained successfully\n");
 
 	panel->enable_gpio = devm_gpiod_get_optional(dev, "enable", GPIOD_ASIS);
 	if (IS_ERR(panel->enable_gpio)) {
@@ -2603,9 +2653,6 @@ static const struct panel_desc innolux_g121x1_l03 = {
 		.unprepare = 200,
 		.disable = 400,
 	},
-	.bus_format = MEDIA_BUS_FMT_RGB666_1X7X3_SPWG,
-	.bus_flags = DRM_BUS_FLAG_DE_HIGH,
-	.connector_type = DRM_MODE_CONNECTOR_LVDS,
 };
 
 static const struct drm_display_mode innolux_n156bge_l21_mode = {
@@ -2688,7 +2735,6 @@ static const struct display_timing koe_tx26d202vm0bwa_timing = {
 	.vfront_porch = { 3, 5, 10 },
 	.vback_porch = { 2, 5, 10 },
 	.vsync_len = { 5, 5, 5 },
-	.flags = DISPLAY_FLAGS_DE_HIGH,
 };
 
 static const struct panel_desc koe_tx26d202vm0bwa = {
@@ -4255,7 +4301,6 @@ static const struct of_device_id platform_of_match[] = {
 	{
 		.compatible = "simple-panel",
 		.data = NULL,
-#ifndef CONFIG_DRM_PANEL_SIMPLE_OF_ONLY
 	}, {
 		.compatible = "ampire,am-1280800n3tzqw-t00h",
 		.data = &ampire_am_1280800n3tzqw_t00h,
@@ -4646,7 +4691,6 @@ static const struct of_device_id platform_of_match[] = {
 	}, {
 		.compatible = "yes-optoelectronics,ytc700tlag-05-201c",
 		.data = &yes_optoelectronics_ytc700tlag_05_201c,
-#endif /* !CONFIG_DRM_PANEL_SIMPLE_OF_ONLY */
 	}, {
 		/* Must be the last entry */
 		.compatible = "panel-dpi",
@@ -4657,26 +4701,27 @@ static const struct of_device_id platform_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, platform_of_match);
 
-static bool of_child_node_is_present(const struct device_node *node,
-				     const char *name)
-{
-	struct device_node *child;
+// static bool of_child_node_is_present(const struct device_node *node,
+// 				     const char *name)
+// {
+// 	struct device_node *child;
 
-	child = of_get_child_by_name(node, name);
-	of_node_put(child);
+// 	child = of_get_child_by_name(node, name);
+// 	of_node_put(child);
 
-	return !!child;
-}
+// 	return !!child;
+// }
 
 static int panel_simple_of_get_desc_data(struct device *dev,
 					 struct panel_desc *desc)
 {
 	struct device_node *np = dev->of_node;
-	u32 bus_flags;
+	//u32 bus_flags;
 	const void *data;
 	int len;
 	int err;
 
+	/* SCG: Disabled - display-timings in DTS are for U-Boot only. Kernel uses hardcoded scg_rm67199_mode.
 	if (of_child_node_is_present(np, "display-timings")) {
 		struct drm_display_mode *mode;
 
@@ -4708,6 +4753,7 @@ static int panel_simple_of_get_desc_data(struct device *dev,
 			desc->bus_flags = bus_flags;
 		}
 	}
+	*/
 
 	if (desc->num_modes || desc->num_timings) {
 		of_property_read_u32(np, "bpc", &desc->bpc);
@@ -4806,14 +4852,6 @@ static struct platform_driver panel_simple_platform_driver = {
 	.probe = panel_simple_platform_probe,
 	.remove = panel_simple_platform_remove,
 	.shutdown = panel_simple_platform_shutdown,
-};
-
-struct panel_desc_dsi {
-	struct panel_desc desc;
-
-	unsigned long flags;
-	enum mipi_dsi_pixel_format format;
-	unsigned int lanes;
 };
 
 static const struct drm_display_mode auo_b080uan01_mode = {
@@ -5018,11 +5056,234 @@ static const struct panel_desc_dsi osd101t2045_53ts = {
 	.lanes = 4,
 };
 
+/* SCG rm67199 Panel Definition for panel-rm67199.c
+ * Panel: TA055FHV11CT
+ * Controller: rm67199
+ *
+ */
+
+/* Display mode for rm67199 1080x1920 AMOLED
+ * Timing values from datasheet page 11, section 5.2:
+ * DCLK: 138 MHz recommended (7.24 ns period)
+ * Horizontal: thd=1080, thpw=2, thb=36, thfp=26
+ * Vertical: tvd=1920, tvpw=4, tvb=16, tvfp=8
+ */
+static const struct drm_display_mode scg_rm67199_mode = {
+	.clock = 132000,  /*  at 50hs, or at 60 132 MHz */
+	.hdisplay = 1080,
+	.hsync_start = 1080 + 26,  /* hfp: 26 per datasheet */
+	.hsync_end = 1080 + 26 + 2,  /* hsync: 2 per datasheet */
+	.htotal = 1200,//1080 + 26 + 2 + 36,  /* hbp: 36 per datasheet */
+	.vdisplay = 1920,
+	.vsync_start = 1920 + 8,  /* vfp: 8 per datasheet */
+	.vsync_end = 1920 + 8 + 4,  /* vsync: 4 per datasheet */
+	.vtotal = 1920 + 8 + 4 + 16,  /* vbp: 16 per datasheet */
+	.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC,  /* Match DTS hsync-active=1, vsync-active=1 */
+};
+
+
+
+
+static int scg_rm67199_panel_init(struct mipi_dsi_device *dsi)
+{
+	struct device *dev = &dsi->dev;
+
+	/* === CMD2 Page 0xA0 (Manufacture Command Set) === */
+	mipi_dsi_generic_write(dsi, (u8[]){0xFE, 0xA0}, 2);  // Select page 0xA0
+	mipi_dsi_generic_write(dsi, (u8[]){0x2B, 0x18}, 2);  // Reserved config
+
+	/* === CMD2 Page 0x70 (Power/Timing Config) === */
+	mipi_dsi_generic_write(dsi, (u8[]){0xFE, 0x70}, 2);  // Select page 0x70
+	mipi_dsi_generic_write(dsi, (u8[]){0x7D, 0x05}, 2);  // sniffed 0x35, guide said 0x05 no visible diff
+	mipi_dsi_generic_write(dsi, (u8[]){0x5D, 0x0A}, 2);  // VGL voltage adjustment
+	mipi_dsi_generic_write(dsi, (u8[]){0x5A, 0x79}, 2);  // VGH voltage config
+	mipi_dsi_generic_write(dsi, (u8[]){0x5C, 0x00}, 2);  // Power sequence timing
+	mipi_dsi_generic_write(dsi, (u8[]){0x52, 0x00}, 2);  // Reserved power config
+
+	/* === CMD2 Page 0xD0 (Display Control) === */
+	mipi_dsi_generic_write(dsi, (u8[]){0xFE, 0xD0}, 2);  // Select page 0xD0
+	mipi_dsi_generic_write(dsi, (u8[]){0x40, 0x02}, 2);  // Display control register
+	mipi_dsi_generic_write(dsi, (u8[]){0x13, 0x40}, 2);  // Panel configuration
+
+	/* === CMD2 Page 0x40 (Source/Gate Driver Config) === */
+	mipi_dsi_generic_write(dsi, (u8[]){0xFE, 0x40}, 2);  // Select page 0x40
+	mipi_dsi_generic_write(dsi, (u8[]){0x05, 0x08}, 2);  // Source output config
+	mipi_dsi_generic_write(dsi, (u8[]){0x06, 0x08}, 2);  // Source output config
+	mipi_dsi_generic_write(dsi, (u8[]){0x08, 0x08}, 2);  // Source output timing
+	mipi_dsi_generic_write(dsi, (u8[]){0x09, 0x08}, 2);  // Source output timing
+	mipi_dsi_generic_write(dsi, (u8[]){0x0A, 0xCA}, 2);  // Source slew rate high byte
+	mipi_dsi_generic_write(dsi, (u8[]){0x0B, 0x88}, 2);  // Source slew rate low byte
+	mipi_dsi_generic_write(dsi, (u8[]){0x20, 0x93}, 2);  // Gate driver control 1
+	mipi_dsi_generic_write(dsi, (u8[]){0x21, 0x93}, 2);  // Gate driver control 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x24, 0x02}, 2);  // Gate timing adjustment
+	mipi_dsi_generic_write(dsi, (u8[]){0x26, 0x02}, 2);  // Gate timing adjustment
+	mipi_dsi_generic_write(dsi, (u8[]){0x28, 0x05}, 2);  // Gate sequence config
+	mipi_dsi_generic_write(dsi, (u8[]){0x2A, 0x05}, 2);  // Gate sequence config
+	mipi_dsi_generic_write(dsi, (u8[]){0x74, 0x2F}, 2);  // GOA timing control
+	mipi_dsi_generic_write(dsi, (u8[]){0x75, 0x1E}, 2);  // GOA timing control
+	mipi_dsi_generic_write(dsi, (u8[]){0xAD, 0x00}, 2);  // Reserved
+
+	/* === CMD2 Page 0x60 (GPIO Mapping / Panel Config) === */
+	mipi_dsi_generic_write(dsi, (u8[]){0xFE, 0x60}, 2);  // Select page 0x60
+	mipi_dsi_generic_write(dsi, (u8[]){0x00, 0xCC}, 2);  // GPIO0 function: VCOM (0xCC)
+	mipi_dsi_generic_write(dsi, (u8[]){0x01, 0x00}, 2);  // GPIO0 config byte 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x02, 0x04}, 2);  // GPIO0 config byte 3
+	mipi_dsi_generic_write(dsi, (u8[]){0x03, 0x00}, 2);  // GPIO0 config byte 4
+	mipi_dsi_generic_write(dsi, (u8[]){0x04, 0x00}, 2);  // GPIO1 function config
+	mipi_dsi_generic_write(dsi, (u8[]){0x05, 0x07}, 2);  // GPIO1 pin control
+	mipi_dsi_generic_write(dsi, (u8[]){0x06, 0x00}, 2);  // GPIO1 config byte 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x07, 0x88}, 2);  // GPIO1 pin assignment
+	mipi_dsi_generic_write(dsi, (u8[]){0x08, 0x00}, 2);  // GPIO2 function config
+	mipi_dsi_generic_write(dsi, (u8[]){0x09, 0xCC}, 2);  // GPIO2 function: VCOM (0xCC)
+	mipi_dsi_generic_write(dsi, (u8[]){0x0A, 0x00}, 2);  // GPIO2 config byte 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x0B, 0x04}, 2);  // GPIO2 config byte 3
+	mipi_dsi_generic_write(dsi, (u8[]){0x0C, 0x00}, 2);  // GPIO2 config byte 4
+	mipi_dsi_generic_write(dsi, (u8[]){0x0D, 0x00}, 2);  // GPIO3 function config
+	mipi_dsi_generic_write(dsi, (u8[]){0x0E, 0x05}, 2);  // GPIO3 pin control
+	mipi_dsi_generic_write(dsi, (u8[]){0x0F, 0x00}, 2);  // GPIO3 config byte 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x10, 0x88}, 2);  // GPIO3 pin assignment
+	mipi_dsi_generic_write(dsi, (u8[]){0x11, 0x00}, 2);  // GPIO4 function config
+	mipi_dsi_generic_write(dsi, (u8[]){0x12, 0xCC}, 2);  // GPIO4 function: VCOM (0xCC)
+	mipi_dsi_generic_write(dsi, (u8[]){0x13, 0x0F}, 2);  // GPIO4 config (bits [3:0]=0xF all enabled)
+	mipi_dsi_generic_write(dsi, (u8[]){0x14, 0xFF}, 2);  // GPIO4 extended config (all bits set)
+	mipi_dsi_generic_write(dsi, (u8[]){0x15, 0x04}, 2);  // GPIO4 config byte 3
+	mipi_dsi_generic_write(dsi, (u8[]){0x16, 0x00}, 2);  // GPIO4 config byte 4
+	mipi_dsi_generic_write(dsi, (u8[]){0x17, 0x06}, 2);  // GPIO5 pin control
+	mipi_dsi_generic_write(dsi, (u8[]){0x18, 0x00}, 2);  // GPIO5 config byte 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x19, 0x96}, 2);  // GPIO5 pin assignment
+	mipi_dsi_generic_write(dsi, (u8[]){0x1A, 0x00}, 2);  // GPIO5 config byte 4
+	mipi_dsi_generic_write(dsi, (u8[]){0x24, 0xCC}, 2);  // GPIO6 function: VCOM (0xCC)
+	mipi_dsi_generic_write(dsi, (u8[]){0x25, 0x00}, 2);  // GPIO6 config byte 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x26, 0x02}, 2);  // GPIO6 config byte 3
+	mipi_dsi_generic_write(dsi, (u8[]){0x27, 0x00}, 2);  // GPIO6 config byte 4
+	mipi_dsi_generic_write(dsi, (u8[]){0x28, 0x00}, 2);  // GPIO7 function config
+	mipi_dsi_generic_write(dsi, (u8[]){0x29, 0x06}, 2);  // GPIO7 pin control
+	mipi_dsi_generic_write(dsi, (u8[]){0x2A, 0x06}, 2);  // GPIO7 extended control
+	mipi_dsi_generic_write(dsi, (u8[]){0x2B, 0x82}, 2);  // GPIO7 pin assignment
+	mipi_dsi_generic_write(dsi, (u8[]){0x2D, 0x00}, 2);  // GPIO7 config byte 5
+	mipi_dsi_generic_write(dsi, (u8[]){0x2F, 0xCC}, 2);  // GPIO8 function: VCOM (0xCC)
+	mipi_dsi_generic_write(dsi, (u8[]){0x30, 0x00}, 2);  // GPIO8 config byte 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x31, 0x02}, 2);  // GPIO8 config byte 3
+	mipi_dsi_generic_write(dsi, (u8[]){0x32, 0x00}, 2);  // GPIO8 config byte 4
+	mipi_dsi_generic_write(dsi, (u8[]){0x33, 0x00}, 2);  // GPIO9 function config
+	mipi_dsi_generic_write(dsi, (u8[]){0x34, 0x07}, 2);  // GPIO9 pin control
+	mipi_dsi_generic_write(dsi, (u8[]){0x35, 0x06}, 2);  // GPIO9 extended control
+	mipi_dsi_generic_write(dsi, (u8[]){0x36, 0x82}, 2);  // GPIO9 pin assignment
+	mipi_dsi_generic_write(dsi, (u8[]){0x37, 0x00}, 2);  // GPIO9 config byte 5
+	mipi_dsi_generic_write(dsi, (u8[]){0x38, 0xCC}, 2);  // GPIO10 function: VCOM (0xCC)
+	mipi_dsi_generic_write(dsi, (u8[]){0x39, 0x00}, 2);  // GPIO10 config byte 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x3A, 0x02}, 2);  // GPIO10 config byte 3
+	mipi_dsi_generic_write(dsi, (u8[]){0x3B, 0x00}, 2);  // GPIO10 config byte 4
+	mipi_dsi_generic_write(dsi, (u8[]){0x3D, 0x00}, 2);  // GPIO11 function config
+	mipi_dsi_generic_write(dsi, (u8[]){0x3F, 0x07}, 2);  // GPIO11 pin control
+	mipi_dsi_generic_write(dsi, (u8[]){0x40, 0x00}, 2);  // GPIO11 config byte 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x41, 0x88}, 2);  // GPIO11 pin assignment
+	mipi_dsi_generic_write(dsi, (u8[]){0x42, 0x00}, 2);  // GPIO12 function config
+	mipi_dsi_generic_write(dsi, (u8[]){0x43, 0xCC}, 2);  // GPIO12 function: VCOM (0xCC)
+	mipi_dsi_generic_write(dsi, (u8[]){0x44, 0x00}, 2);  // GPIO12 config byte 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x45, 0x02}, 2);  // GPIO12 config byte 3
+	mipi_dsi_generic_write(dsi, (u8[]){0x46, 0x00}, 2);  // GPIO12 config byte 4
+	mipi_dsi_generic_write(dsi, (u8[]){0x47, 0x00}, 2);  // GPIO13 function config
+	mipi_dsi_generic_write(dsi, (u8[]){0x48, 0x06}, 2);  // GPIO13 pin control
+	mipi_dsi_generic_write(dsi, (u8[]){0x49, 0x02}, 2);  // GPIO13 config byte 2
+	mipi_dsi_generic_write(dsi, (u8[]){0x4A, 0x8A}, 2);  // GPIO13 pin assignment
+	mipi_dsi_generic_write(dsi, (u8[]){0x4B, 0x00}, 2);  // GPIO13 config byte 4
+	mipi_dsi_generic_write(dsi, (u8[]){0x5F, 0xCA}, 2);  // VCOM amplitude high byte (VCOM = 0x01CA = 458)
+	mipi_dsi_generic_write(dsi, (u8[]){0x60, 0x01}, 2);  // VCOM amplitude low byte
+	mipi_dsi_generic_write(dsi, (u8[]){0x61, 0xE8}, 2);  // H-sync timing high byte (H-period = 0x09E8 = 2536)
+	mipi_dsi_generic_write(dsi, (u8[]){0x62, 0x09}, 2);  // H-sync timing low byte
+	mipi_dsi_generic_write(dsi, (u8[]){0x63, 0x00}, 2);  // V-sync timing high byte (V-total = 0x0730 = 1840)
+	mipi_dsi_generic_write(dsi, (u8[]){0x64, 0x07}, 2);  // V-sync timing middle byte
+	mipi_dsi_generic_write(dsi, (u8[]){0x65, 0x00}, 2);  // V-sync timing low byte
+	mipi_dsi_generic_write(dsi, (u8[]){0x66, 0x30}, 2);  // Panel timing config
+	mipi_dsi_generic_write(dsi, (u8[]){0x67, 0x00}, 2);  // Brightness control (bit 7=enable, bits [6:0]=reserved)
+	mipi_dsi_generic_write(dsi, (u8[]){0x9B, 0x03}, 2);  // Source pre-charge control (bits [1:0]=0x3)
+	mipi_dsi_generic_write(dsi, (u8[]){0xA9, 0x07}, 2);  // Panel scan order: GPIO L→R pin 7
+	mipi_dsi_generic_write(dsi, (u8[]){0xAA, 0x06}, 2);  // Panel scan order: GPIO L→R pin 6
+	mipi_dsi_generic_write(dsi, (u8[]){0xAB, 0x02}, 2);  // Panel scan order: GPIO L→R pin 2
+	mipi_dsi_generic_write(dsi, (u8[]){0xAC, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xAD, 0x11}, 2);  // Panel scan order: GND/Dummy (0x11=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xAE, 0x05}, 2);  // Panel scan order: GPIO R→L pin 5
+	mipi_dsi_generic_write(dsi, (u8[]){0xAF, 0x04}, 2);  // Panel scan order: GPIO R→L pin 4
+	mipi_dsi_generic_write(dsi, (u8[]){0xB0, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xB1, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xB2, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xB3, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xB4, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xB5, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xB6, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xB7, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xB8, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xB9, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xBA, 0x04}, 2);  // Panel scan order: GPIO R→L pin 4
+	mipi_dsi_generic_write(dsi, (u8[]){0xBB, 0x05}, 2);  // Panel scan order: GPIO R→L pin 5
+	mipi_dsi_generic_write(dsi, (u8[]){0xBC, 0x00}, 2);  // Panel scan order: GPIO R→L pin 0
+	mipi_dsi_generic_write(dsi, (u8[]){0xBD, 0x01}, 2);  // Panel scan order: GPIO R→L pin 1
+	mipi_dsi_generic_write(dsi, (u8[]){0xBE, 0x0A}, 2);  // Panel scan order: GPIO R→L pin 10
+	mipi_dsi_generic_write(dsi, (u8[]){0xBF, 0x10}, 2);  // Panel scan order: GND/Dummy (0x10=dummy pin)
+	mipi_dsi_generic_write(dsi, (u8[]){0xC0, 0x11}, 2);  // Panel scan order: GND/Dummy (0x11=dummy pin)
+
+	/* === Back to CMD2 Page 0xA0 === */
+	mipi_dsi_generic_write(dsi, (u8[]){0xFE, 0xA0}, 2);  // Select page 0xA0
+	mipi_dsi_generic_write(dsi, (u8[]){0x22, 0x00}, 2);  // Final config write
+
+	/* === CMD1 Page 0x00 (User Command Set / Standard DCS) === */
+	mipi_dsi_generic_write(dsi, (u8[]){0xFE, 0x00}, 2);  // Select page 0x00 (standard DCS)
+	mipi_dsi_generic_write(dsi, (u8[]){0xC2, 0x08}, 2);  // Interface pixel format related
+	mipi_dsi_generic_write(dsi, (u8[]){0x44, 0x00}, 2);  // Set tear scanline (sniffed: 1 param, not 2)
+	mipi_dsi_generic_write(dsi, (u8[]){0x35, 0x00}, 2);  // Set tear on (TE signal enable)
+
+	/* === Standard MIPI DCS Commands === */
+	mipi_dsi_dcs_write(dsi, 0x11, NULL, 0);              // SLPOUT - Exit sleep mode
+	msleep(150);                                          // Wait 150ms for panel power stabilization
+
+	mipi_dsi_dcs_write(dsi, 0x29, NULL, 0);              // DISPON - Display on
+
+	/* === Default Brightness Configuration === */
+	mipi_dsi_generic_write(dsi, (u8[]){0xFE, 0x60}, 2);  // Select page 0x60
+	mipi_dsi_generic_write(dsi, (u8[]){0x67, 0x80}, 2);  // Enable brightness control (bit 7=1)
+	mipi_dsi_generic_write(dsi, (u8[]){0xFE, 0x00}, 2);  // Back to page 0x00
+	mipi_dsi_generic_write(dsi, (u8[]){0x51, 0x90}, 2);  // Set brightness 0x90/255 (144/255 = 56%)
+	mipi_dsi_generic_write(dsi, (u8[]){0x53, 0x20}, 2);  // Write CTRL display (bit 5=BCTRL enable)
+
+	msleep(20);                                          // Final stabilization delay
+
+	dev_info(dev, "rm67199 init complete\n");
+	return 0;
+}
+
+
+
+/* Panel descriptor for SCG rm67199 */
+static const struct panel_desc_dsi scg_rm67199 = {
+	.desc = {
+		.modes = &scg_rm67199_mode,
+		.num_modes = 1,
+		.bpc = 8,
+		.size = {
+			.width = 68,   /* 68mm width (5.5" diagonal, 9:16 aspect) */
+			.height = 121,  /* 121mm height */
+		},
+		.delay = {
+			.reset = 50,   /* Hold in reset for 50ms after power on */
+			.init = 120,   /* Wait 120ms after releasing reset before sending commands */
+		},
+		/* init_seq removed - using direct function call scg_rm67199_panel_init() instead */
+		.connector_type = DRM_MODE_CONNECTOR_DSI,
+	},
+	/* Original flags - Video burst + LPM + No EOT */
+	.flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST | MIPI_DSI_MODE_LPM , MIPI_DSI_MODE_NO_EOT_PACKET,
+	.format = MIPI_DSI_FMT_RGB888,
+	.lanes = 4,
+};
+
+
+
+
 static const struct of_device_id dsi_of_match[] = {
 	{
 		.compatible = "simple-panel-dsi",
-		.data = NULL,
-#ifndef CONFIG_DRM_PANEL_SIMPLE_OF_ONLY
+		.data = &scg_rm67199,
 	}, {
 		.compatible = "auo,b080uan01",
 		.data = &auo_b080uan01
@@ -5044,7 +5305,6 @@ static const struct of_device_id dsi_of_match[] = {
 	}, {
 		.compatible = "osddisplays,osd101t2045-53ts",
 		.data = &osd101t2045_53ts
-#endif /* !CONFIG_DRM_PANEL_SIMPLE_OF_ONLY */
 	}, {
 		/* sentinel */
 	}
@@ -5083,9 +5343,15 @@ static int panel_simple_dsi_probe(struct mipi_dsi_device *dsi)
 	const struct of_device_id *id;
 	int err;
 
+	dev_info(dev, "panel-simple-dsi: probe starting\n");
+
 	id = of_match_node(dsi_of_match, dsi->dev.of_node);
-	if (!id)
+	if (!id) {
+		dev_err(dev, "panel-simple-dsi: no matching device tree node found\n");
 		return -ENODEV;
+	}
+
+	dev_info(dev, "panel-simple-dsi: matched compatible string\n");
 
 	if (!id->data) {
 		d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
@@ -5101,9 +5367,14 @@ static int panel_simple_dsi_probe(struct mipi_dsi_device *dsi)
 
 	desc = id->data ? id->data : d;
 
+	dev_info(dev, "panel-simple-dsi: calling panel_simple_probe\n");
 	err = panel_simple_probe(&dsi->dev, &desc->desc);
-	if (err < 0)
+	if (err < 0) {
+		dev_err(dev, "panel-simple-dsi: panel_simple_probe failed: %d\n", err);
 		return err;
+	}
+
+	dev_info(dev, "panel-simple-dsi: panel_simple_probe succeeded\n");
 
 	panel = dev_get_drvdata(dev);
 	panel->dsi = dsi;
@@ -5131,15 +5402,22 @@ static int panel_simple_dsi_probe(struct mipi_dsi_device *dsi)
 	dsi->mode_flags = desc->flags;
 	dsi->format = desc->format;
 	dsi->lanes = desc->lanes;
+	//dsi->hs_rate = 500000000;  /* 500 MHz */
+	//dsi->lp_rate = 10000000;  /* 10 MHz LP clock for command mode */
 
+	//dev_info(dev, "DSI rates: hs_rate=%lu lp_rate=%lu\n", dsi->hs_rate, dsi->lp_rate);
+	dev_info(dev, "panel-simple-dsi: calling mipi_dsi_attach\n");
 	err = mipi_dsi_attach(dsi);
 	if (err) {
 		struct panel_simple *panel = mipi_dsi_get_drvdata(dsi);
 
+		dev_err(dev, "panel-simple-dsi: mipi_dsi_attach failed: %d\n", err);
 		drm_panel_remove(&panel->base);
+		return err;
 	}
 
-	return err;
+	dev_info(dev, "panel-simple-dsi: probe completed successfully\n");
+	return 0;
 }
 
 static void panel_simple_dsi_remove(struct mipi_dsi_device *dsi)
@@ -5158,10 +5436,36 @@ static void panel_simple_dsi_shutdown(struct mipi_dsi_device *dsi)
 	panel_simple_shutdown(&dsi->dev);
 }
 
+static int panel_simple_dsi_suspend(struct device *dev)
+{
+	struct panel_simple *panel = dev_get_drvdata(dev);
+
+	if (!panel || !panel->base.dev)
+		return 0;
+
+	return panel_simple_unprepare(&panel->base);
+}
+
+static int panel_simple_dsi_resume(struct device *dev)
+{
+	struct panel_simple *panel = dev_get_drvdata(dev);
+
+	if (!panel || !panel->base.dev)
+		return 0;
+
+	return panel_simple_prepare(&panel->base);
+}
+
+static const struct dev_pm_ops panel_simple_dsi_pm_ops = {
+	.suspend = panel_simple_dsi_suspend,
+	.resume = panel_simple_dsi_resume,
+};
+
 static struct mipi_dsi_driver panel_simple_dsi_driver = {
 	.driver = {
 		.name = "panel-simple-dsi",
 		.of_match_table = dsi_of_match,
+        .pm = &panel_simple_dsi_pm_ops,
 	},
 	.probe = panel_simple_dsi_probe,
 	.remove = panel_simple_dsi_remove,
