@@ -1036,6 +1036,9 @@ struct dwc3_scratchpad_array {
  * @usb3_phy: pointer to USB3 PHY
  * @usb2_generic_phy: pointer to USB2 PHY
  * @usb3_generic_phy: pointer to USB3 PHY
+ * @usb3_phy_nb: notifier for USB3 PHY reset events
+ * @phy_reset_active: USB3 PHY reset is currently in progress
+ * @phy_reset_pm_ref: reset notification holds a runtime PM reference
  * @phys_ready: flag to indicate that PHYs are ready
  * @ulpi: pointer to ulpi interface
  * @ulpi_ready: flag to indicate that ULPI is initialized
@@ -1182,6 +1185,9 @@ struct dwc3 {
 
 	struct phy		*usb2_generic_phy;
 	struct phy		*usb3_generic_phy;
+	struct notifier_block	usb3_phy_nb;
+	bool			phy_reset_active;
+	bool			phy_reset_pm_ref;
 
 	bool			phys_ready;
 

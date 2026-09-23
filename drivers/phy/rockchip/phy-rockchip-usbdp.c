@@ -171,6 +171,7 @@ struct rockchip_udphy {
 
 	/* utilized for USB */
 	bool hs; /* flag for high-speed */
+	struct phy *phy_u3;
 
 	/* utilized for DP */
 	struct gpio_desc *sbu1_dc_gpio;
@@ -479,18 +480,6 @@ static int udphy_get_rst_idx(const char * const *list, int num, char *name)
 	return -EINVAL;
 }
 
-static int udphy_reset_assert(struct rockchip_udphy *udphy, char *name)
-{
-	const struct rockchip_udphy_cfg *cfg = udphy->cfgs;
-	int idx;
-
-	idx = udphy_get_rst_idx(cfg->rst_list, cfg->num_rsts, name);
-	if (idx < 0)
-		return idx;
-
-	return reset_control_assert(udphy->rsts[idx]);
-}
-
 static int udphy_reset_deassert(struct rockchip_udphy *udphy, char *name)
 {
 	const struct rockchip_udphy_cfg *cfg = udphy->cfgs;
@@ -501,6 +490,15 @@ static int udphy_reset_deassert(struct rockchip_udphy *udphy, char *name)
 		return idx;
 
 	return reset_control_deassert(udphy->rsts[idx]);
+}
+
+static void udphy_reset_assert_all(struct rockchip_udphy *udphy)
+{
+	const struct rockchip_udphy_cfg *cfg = udphy->cfgs;
+	int i;
+
+	for (i = 0; i < cfg->num_rsts; i++)
+		reset_control_assert(udphy->rsts[i]);
 }
 
 static void udphy_u3_port_disable(struct rockchip_udphy *udphy, u8 disable)
@@ -674,6 +672,7 @@ static int udphy_orien_sw_set(struct typec_switch_dev *sw,
 			      enum typec_orientation orien)
 {
 	struct rockchip_udphy *udphy = typec_switch_get_drvdata(sw);
+	bool flipped = orien == TYPEC_ORIENTATION_REVERSE;
 
 	mutex_lock(&udphy->mutex);
 
@@ -685,7 +684,10 @@ static int udphy_orien_sw_set(struct typec_switch_dev *sw,
 		goto unlock_ret;
 	}
 
-	udphy->flip = (orien == TYPEC_ORIENTATION_REVERSE) ? true : false;
+	if (udphy->mode != UDPHY_MODE_DP_USB || udphy->flip != flipped)
+		udphy->mode_change = true;
+
+	udphy->flip = flipped;
 	udphy_set_typec_default_mapping(udphy);
 	udphy_usb_bvalid_enable(udphy, true);
 
@@ -761,7 +763,8 @@ static int udphy_status_check(struct rockchip_udphy *udphy)
 					       val, (val & CMN_ANA_LCPLL_AFC_DONE) &&
 					       (val & CMN_ANA_LCPLL_LOCK_DONE), 200, 100000);
 		if (ret) {
-			dev_err(udphy->dev, "cmn ana lcpll lock timeout\n");
+			dev_err(udphy->dev,
+				"cmn ana lcpll lock timeout, status 0x%08x\n", val);
 			return ret;
 		}
 	}
@@ -796,6 +799,10 @@ static int udphy_init(struct rockchip_udphy *udphy)
 {
 	const struct rockchip_udphy_cfg *cfg = udphy->cfgs;
 	int ret;
+
+	/* Resets need an enabled reference clock to reach the PHY reliably. */
+	udphy_reset_assert_all(udphy);
+	usleep_range(10000, 11000);
 
 	/* enable rx lfps for usb */
 	if (udphy->mode & UDPHY_MODE_USB)
@@ -856,13 +863,8 @@ static int udphy_init(struct rockchip_udphy *udphy)
 	return 0;
 
 assert_phy:
-	udphy_reset_assert(udphy, "init");
-	udphy_reset_assert(udphy, "cmn");
-	udphy_reset_assert(udphy, "lane");
-
 assert_apb:
-	udphy_reset_assert(udphy, "pma_apb");
-	udphy_reset_assert(udphy, "pcs_apb");
+	udphy_reset_assert_all(udphy);
 	return ret;
 }
 
@@ -888,13 +890,8 @@ static int udphy_setup(struct rockchip_udphy *udphy)
 
 static int udphy_disable(struct rockchip_udphy *udphy)
 {
-	const struct rockchip_udphy_cfg *cfg = udphy->cfgs;
-	int i;
-
 	clk_bulk_disable_unprepare(udphy->num_clks, udphy->clks);
-
-	for (i = 0; i < cfg->num_rsts; i++)
-		reset_control_assert(udphy->rsts[i]);
+	udphy_reset_assert_all(udphy);
 
 	return 0;
 }
@@ -969,12 +966,19 @@ static int udphy_get_initial_status(struct rockchip_udphy *udphy)
 		reset_control_deassert(udphy->rsts[i]);
 
 	regmap_read(udphy->pma_regmap, CMN_LANE_MUX_AND_EN_OFFSET, &value);
-	if (FIELD_GET(CMN_DP_LANE_MUX_ALL, value) && FIELD_GET(CMN_DP_LANE_EN_ALL, value))
+	dev_info(udphy->dev, "initial lane mux and enable 0x%08x\n", value);
+	if (FIELD_GET(CMN_DP_LANE_MUX_ALL, value) &&
+	    FIELD_GET(CMN_DP_LANE_EN_ALL, value)) {
 		udphy->status = UDPHY_MODE_DP;
-	else
-		udphy_disable(udphy);
+		grfreg_write(udphy->vogrf,
+			     &cfg->vogrfcfg[udphy->id].hpd_trigger, false);
+		msleep(100);
+	}
 
-	return 0;
+	udphy_u3_port_disable(udphy, true);
+	udphy->status = UDPHY_MODE_NONE;
+
+	return udphy_disable(udphy);
 }
 
 static int udphy_parse_dt(struct rockchip_udphy *udphy, struct device *dev)
@@ -1061,35 +1065,47 @@ static int udphy_power_on(struct rockchip_udphy *udphy, u8 mode)
 {
 	int ret;
 
+	dev_info(udphy->dev,
+		 "power on request 0x%02x, mode 0x%02x, status 0x%02x, change %u\n",
+		 mode, udphy->mode, udphy->status, udphy->mode_change);
+
 	if (!(udphy->mode & mode)) {
 		dev_info(udphy->dev, "mode 0x%02x is not support\n", mode);
 		return 0;
 	}
 
 	if (udphy->status == UDPHY_MODE_NONE) {
-		udphy->mode_change = false;
+		phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_PRE_RESET);
+		udphy_u3_port_disable(udphy, true);
+		udelay(10);
+
 		ret = udphy_setup(udphy);
-		if (ret)
+		if (ret) {
+			phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_POST_RESET);
 			return ret;
+		}
+
+		if (!udphy->hs && udphy->mode & UDPHY_MODE_USB)
+			udphy_u3_port_disable(udphy, false);
+		udphy->mode_change = false;
+		phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_POST_RESET);
 	} else if (udphy->mode_change) {
-		udphy->mode_change = false;
 		udphy->status = UDPHY_MODE_NONE;
+		phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_PRE_RESET);
 
-		/*
-		 * For DP 4xlanes + USB2 only scenario, it needs to
-		 * select utmi clock from the USB2 PHY for the USB
-		 * controller source clock, then it can safely disable
-		 * the USBDP PHY later to reconfigure lanes for DP.
-		 */
-		if (udphy->mode == UDPHY_MODE_DP)
-			udphy_u3_port_disable(udphy, true);
+		udphy_u3_port_disable(udphy, true);
+		udelay(10);
 
-		ret = udphy_disable(udphy);
-		if (ret)
+		ret = udphy_init(udphy);
+		if (ret) {
+			phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_POST_RESET);
 			return ret;
-		ret = udphy_setup(udphy);
-		if (ret)
-			return ret;
+		}
+
+		if (!udphy->hs && udphy->mode & UDPHY_MODE_USB)
+			udphy_u3_port_disable(udphy, false);
+		udphy->mode_change = false;
+		phy_notify_reset(udphy->phy_u3, PHY_NOTIFY_POST_RESET);
 	}
 
 	udphy->status |= mode;
@@ -1434,6 +1450,10 @@ static int usbdp_typec_mux_set(struct typec_mux_dev *mux,
 		break;
 	}
 
+	dev_info(udphy->dev,
+		 "Type-C mux state %lu, next mode 0x%02x, current mode 0x%02x\n",
+		 state->mode, mode, udphy->mode);
+
 	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID) {
 		struct typec_displayport_data *data = state->data;
 
@@ -1524,6 +1544,7 @@ static int rockchip_udphy_probe(struct platform_device *pdev)
 	udphy = devm_kzalloc(dev, sizeof(*udphy), GFP_KERNEL);
 	if (!udphy)
 		return -ENOMEM;
+	udphy->dev = dev;
 
 	id = of_alias_get_id(dev->of_node, "usbdp");
 	if (id < 0)
@@ -1557,7 +1578,6 @@ static int rockchip_udphy_probe(struct platform_device *pdev)
 		return ret;
 
 	mutex_init(&udphy->mutex);
-	udphy->dev = dev;
 	platform_set_drvdata(pdev, udphy);
 
 	udphy->no_aux_polarity_invert =
@@ -1601,6 +1621,7 @@ static int rockchip_udphy_probe(struct platform_device *pdev)
 				dev_err(dev, "failed to create usb phy: %pOFn\n", child_np);
 				goto put_child;
 			}
+			udphy->phy_u3 = phy;
 		} else
 			continue;
 

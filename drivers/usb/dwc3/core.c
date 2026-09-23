@@ -925,6 +925,88 @@ static void dwc3_core_exit(struct dwc3 *dwc)
 	reset_control_assert(dwc->reset);
 }
 
+static int dwc3_usb3_phy_notify(struct notifier_block *nb,
+				unsigned long action, void *data)
+{
+	struct dwc3 *dwc = container_of(nb, struct dwc3, usb3_phy_nb);
+	unsigned long flags;
+	bool pm_ref;
+	u32 reg;
+	int ret;
+
+	switch (action) {
+	case PHY_NOTIFY_PRE_RESET:
+		ret = pm_runtime_get_if_active(dwc->dev, true);
+		if (!ret)
+			return NOTIFY_OK;
+
+		spin_lock_irqsave(&dwc->lock, flags);
+		if (dwc->phy_reset_active) {
+			spin_unlock_irqrestore(&dwc->lock, flags);
+			if (ret > 0)
+				pm_runtime_put_autosuspend(dwc->dev);
+			return NOTIFY_OK;
+		}
+
+		dwc->phy_reset_active = true;
+		dwc->phy_reset_pm_ref = ret > 0;
+		reg = dwc3_readl(dwc->regs, DWC3_GUSB3PIPECTL(0));
+		reg |= DWC3_GUSB3PIPECTL_PHYSOFTRST;
+		dwc3_writel(dwc->regs, DWC3_GUSB3PIPECTL(0), reg);
+		spin_unlock_irqrestore(&dwc->lock, flags);
+		dev_info(dwc->dev, "USB3 PHY soft reset asserted\n");
+		break;
+
+	case PHY_NOTIFY_POST_RESET:
+		spin_lock_irqsave(&dwc->lock, flags);
+		if (!dwc->phy_reset_active) {
+			spin_unlock_irqrestore(&dwc->lock, flags);
+			return NOTIFY_OK;
+		}
+
+		dwc->phy_reset_active = false;
+		pm_ref = dwc->phy_reset_pm_ref;
+		dwc->phy_reset_pm_ref = false;
+		reg = dwc3_readl(dwc->regs, DWC3_GUSB3PIPECTL(0));
+		reg &= ~DWC3_GUSB3PIPECTL_PHYSOFTRST;
+		dwc3_writel(dwc->regs, DWC3_GUSB3PIPECTL(0), reg);
+		spin_unlock_irqrestore(&dwc->lock, flags);
+		dev_info(dwc->dev, "USB3 PHY soft reset deasserted\n");
+
+		if (pm_ref)
+			pm_runtime_put_autosuspend(dwc->dev);
+		break;
+	}
+
+	return NOTIFY_OK;
+}
+
+static void dwc3_phy_register_notifier(struct dwc3 *dwc)
+{
+	int ret;
+
+	if (!dwc->usb3_generic_phy)
+		return;
+
+	dwc->usb3_phy_nb.notifier_call = dwc3_usb3_phy_notify;
+	ret = phy_register_notifier(dwc->usb3_generic_phy,
+				    &dwc->usb3_phy_nb);
+	if (ret)
+		dev_warn(dwc->dev, "failed to register USB3 PHY notifier: %d\n", ret);
+}
+
+static void dwc3_phy_unregister_notifier(struct dwc3 *dwc)
+{
+	if (!dwc->usb3_generic_phy)
+		return;
+
+	phy_unregister_notifier(dwc->usb3_generic_phy, &dwc->usb3_phy_nb);
+	if (dwc->phy_reset_pm_ref)
+		pm_runtime_put_autosuspend(dwc->dev);
+	dwc->phy_reset_pm_ref = false;
+	dwc->phy_reset_active = false;
+}
+
 static bool dwc3_core_is_valid(struct dwc3 *dwc)
 {
 	u32 reg;
@@ -2087,6 +2169,7 @@ static int dwc3_probe(struct platform_device *pdev)
 
 	dwc3_check_params(dwc);
 	dwc3_debugfs_init(dwc);
+	dwc3_phy_register_notifier(dwc);
 
 	ret = dwc3_core_init_mode(dwc);
 	if (ret)
@@ -2113,6 +2196,7 @@ static int dwc3_probe(struct platform_device *pdev)
 	return 0;
 
 err5:
+	dwc3_phy_unregister_notifier(dwc);
 	dwc3_debugfs_exit(dwc);
 	dwc3_event_buffers_cleanup(dwc);
 
@@ -2158,6 +2242,7 @@ static int dwc3_remove(struct platform_device *pdev)
 
 	dwc3_core_exit_mode(dwc);
 	dwc3_debugfs_exit(dwc);
+	dwc3_phy_unregister_notifier(dwc);
 
 	dwc3_core_exit(dwc);
 	dwc3_ulpi_exit(dwc);

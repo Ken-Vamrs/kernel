@@ -638,9 +638,9 @@
 &usbdp_phy1 {
 	status = "okay";
 	orientation-switch;
+	mode-switch;
 	svid = <0xff01>;
 	rockchip,no-aux-polarity-invert;
-	rockchip,dp-lane-mux = <0 1 2 3>;
 
 	port {
 		#address-cells = <1>;
@@ -684,7 +684,6 @@
 		interrupts = <RK_PC6 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpios = <&gpio1 RK_PD5 GPIO_ACTIVE_LOW>;
 		pinctrl-1 = <&usbc0_gpio>;
-		vbus-supply = <&vbus5v0_typec>;
 		id = <3>;
 		reg = <0x51>;
 		status = "okay";

@@ -269,6 +269,7 @@
 #define SDP_REG_BANK_SIZE			16
 
 #define DPTX_MAX_STREAMS			4
+#define DPTX_LINK_TRAINING_MAX_ATTEMPTS		3
 
 enum {
 	RK3576_DP,
@@ -497,6 +498,7 @@ struct dw_dp {
 	u32 max_link_rate;
 
 	bool is_loader_protect;
+	bool link_phy_powered;
 	bool support_mst;
 	bool is_mst;
 	bool is_fix_port;
@@ -1626,22 +1628,15 @@ static void dw_dp_link_reset(struct dw_dp_link *link)
 static int dw_dp_link_power_up(struct dw_dp *dp)
 {
 	struct dw_dp_link *link = &dp->link;
-	u8 value;
 	int ret;
 
 	if (link->revision < 0x11)
 		return 0;
 
-	ret = drm_dp_dpcd_readb(&dp->aux, DP_SET_POWER, &value);
-	if (ret < 0)
-		return ret;
-
-	value &= ~DP_SET_POWER_MASK;
-	value |= DP_SET_POWER_D0;
-
-	ret = drm_dp_dpcd_writeb(&dp->aux, DP_SET_POWER, value);
-	if (ret < 0)
-		return ret;
+	/* A sleeping sink may not answer reads until it receives D0. */
+	ret = drm_dp_dpcd_writeb(&dp->aux, DP_SET_POWER, DP_SET_POWER_D0);
+	if (ret != 1)
+		return ret < 0 ? ret : -EIO;
 
 	usleep_range(1000, 2000);
 
@@ -3114,6 +3109,17 @@ static int dw_dp_aux_read_data(struct dw_dp *dp, u8 *buffer, size_t size)
 	return size;
 }
 
+static void dw_dp_aux_reset(struct dw_dp *dp)
+{
+	/* Call with aux.hw_mutex held and the controller powered. */
+	regmap_update_bits(dp->regmap, DPTX_SOFT_RESET_CTRL,
+			   AUX_RESET, FIELD_PREP(AUX_RESET, 1));
+	usleep_range(10, 20);
+	regmap_update_bits(dp->regmap, DPTX_SOFT_RESET_CTRL,
+			   AUX_RESET, FIELD_PREP(AUX_RESET, 0));
+	synchronize_irq(dp->irq);
+}
+
 static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
 				  struct drm_dp_aux_msg *msg)
 {
@@ -3150,17 +3156,24 @@ static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
 		value = FIELD_PREP(I2C_ADDR_ONLY, 1);
 	value |= FIELD_PREP(AUX_CMD_TYPE, msg->request);
 	value |= FIELD_PREP(AUX_ADDR, msg->address);
+	reinit_completion(&dp->complete);
 	regmap_write(dp->regmap, DPTX_AUX_CMD, value);
 
 	status = wait_for_completion_timeout(&dp->complete, timeout);
 	if (!status) {
-		dev_dbg(dp->dev, "timeout waiting for AUX reply\n");
+		dev_warn_ratelimited(dp->dev,
+				     "AUX reply timeout: request 0x%x address 0x%x size %zu\n",
+				     msg->request, msg->address, msg->size);
+		dw_dp_aux_reset(dp);
 		ret = -ETIMEDOUT;
 		goto out;
 	}
 
 	regmap_read(dp->regmap, DPTX_AUX_STATUS, &value);
 	if (value & AUX_TIMEOUT) {
+		dev_dbg(dp->dev,
+			"AUX hardware timeout: request 0x%x address 0x%x status 0x%x\n",
+			msg->request, msg->address, value);
 		ret = -ETIMEDOUT;
 		goto out;
 	}
@@ -3239,13 +3252,41 @@ dw_dp_bridge_mode_valid(struct drm_bridge *bridge,
 	return MODE_OK;
 }
 
+static int dw_dp_link_phy_power_on(struct dw_dp *dp)
+{
+	int ret;
+
+	if (dp->link_phy_powered)
+		return 0;
+
+	ret = phy_power_on(dp->phy);
+	if (!ret)
+		dp->link_phy_powered = true;
+
+	return ret;
+}
+
+static int dw_dp_link_phy_power_off(struct dw_dp *dp)
+{
+	int ret;
+
+	if (!dp->link_phy_powered)
+		return 0;
+
+	ret = phy_power_off(dp->phy);
+	if (!ret)
+		dp->link_phy_powered = false;
+
+	return ret;
+}
+
 static void _dw_dp_loader_protect(struct dw_dp *dp, bool on)
 {
 	struct dw_dp_link *link = &dp->link;
 	struct drm_connector *conn = &dp->connector;
 	struct drm_display_info *di = &conn->display_info;
-
 	u32 value;
+	int ret;
 
 	if (on) {
 		if (dp->dynamic_pd_ctrl)
@@ -3291,9 +3332,13 @@ static void _dw_dp_loader_protect(struct dw_dp *dp, bool on)
 
 		extcon_set_state_sync(dp->audio->extcon, EXTCON_DISP_DP, true);
 		dw_dp_audio_handle_plugged_change(dp->audio, true);
-		phy_power_on(dp->phy);
+		ret = dw_dp_link_phy_power_on(dp);
+		if (ret)
+			dev_err(dp->dev, "loader PHY power on failed: %d\n", ret);
 	} else {
-		phy_power_off(dp->phy);
+		ret = dw_dp_link_phy_power_off(dp);
+		if (ret)
+			dev_err(dp->dev, "loader PHY power off failed: %d\n", ret);
 		extcon_set_state_sync(dp->audio->extcon, EXTCON_DISP_DP, false);
 		dw_dp_audio_handle_plugged_change(dp->audio, false);
 
@@ -3784,7 +3829,7 @@ static void dw_dp_mst_encoder_atomic_enable(struct drm_encoder *encoder,
 	if (first_mst_stream) {
 		dw_dp_limit_max_link_rate(dp);
 
-		ret = phy_power_on(dp->phy);
+		ret = dw_dp_link_phy_power_on(dp);
 		if (ret)
 			dev_err(dp->dev, "phy power on failed: %d\n", ret);
 
@@ -3828,19 +3873,25 @@ static void dw_dp_mst_encoder_atomic_enable(struct drm_encoder *encoder,
 	drm_dp_add_payload_part2(&dp->mst_mgr, state, payload);
 }
 
-static void dw_dp_link_disable(struct dw_dp *dp)
+static void dw_dp_link_disable(struct dw_dp *dp, bool power_down_sink)
 {
 	struct dw_dp_link *link = &dp->link;
+	int ret;
 
-	if (dw_dp_detect(dp))
+	link->train.clock_recovered = false;
+	link->train.channel_equalized = false;
+
+	if (!dp->link_phy_powered)
+		return;
+
+	if (power_down_sink && dw_dp_detect(dp))
 		dw_dp_link_power_down(dp);
 
 	dw_dp_phy_xmit_enable(dp, 0);
 
-	phy_power_off(dp->phy);
-
-	link->train.clock_recovered = false;
-	link->train.channel_equalized = false;
+	ret = dw_dp_link_phy_power_off(dp);
+	if (ret)
+		dev_err(dp->dev, "link PHY power off failed: %d\n", ret);
 }
 
 static void dw_dp_mst_encoder_atomic_disable(struct drm_encoder *encoder,
@@ -3896,7 +3947,7 @@ static void dw_dp_mst_encoder_atomic_disable(struct drm_encoder *encoder,
 
 	dw_dp_video_disable(dp, mst_enc->stream_id);
 	if (!dp->active_mst_links)
-		dw_dp_link_disable(dp);
+		dw_dp_link_disable(dp, true);
 
 	pm_runtime_mark_last_busy(dp->dev);
 	pm_runtime_put_autosuspend(dp->dev);
@@ -4397,25 +4448,54 @@ static bool dw_dp_needs_link_retrain(struct dw_dp *dp)
 
 static int dw_dp_link_enable(struct dw_dp *dp)
 {
-	int ret;
+	unsigned int attempt;
+	int ret, power_off_ret;
 
-	dw_dp_limit_max_link_rate(dp);
+	for (attempt = 1; attempt <= DPTX_LINK_TRAINING_MAX_ATTEMPTS; attempt++) {
+		dw_dp_limit_max_link_rate(dp);
 
-	ret = phy_power_on(dp->phy);
-	if (ret)
-		return ret;
+		ret = dw_dp_link_phy_power_on(dp);
+		if (ret)
+			return ret;
 
-	ret = dw_dp_link_power_up(dp);
-	if (ret < 0)
-		return ret;
+		ret = dw_dp_link_power_up(dp);
+		if (ret < 0) {
+			dev_warn(dp->dev, "sink D0 request failed: %d\n", ret);
+			if (ret == -ETIMEDOUT && attempt < DPTX_LINK_TRAINING_MAX_ATTEMPTS) {
+				mutex_lock(&dp->aux.hw_mutex);
+				dw_dp_aux_reset(dp);
+				mutex_unlock(&dp->aux.hw_mutex);
+				dev_warn(dp->dev, "AUX reset before link enable retry\n");
+			}
+			goto power_off;
+		}
 
-	ret = dw_dp_link_train(dp);
-	if (ret < 0) {
+		ret = dw_dp_link_train(dp);
+		if (!ret)
+			return 0;
+
 		dev_err(dp->dev, "link training failed: %d\n", ret);
-		return ret;
+		/* Keep the sink awake while another training attempt is pending. */
+		if (attempt == DPTX_LINK_TRAINING_MAX_ATTEMPTS)
+			dw_dp_link_power_down(dp);
+
+power_off:
+		dw_dp_phy_xmit_enable(dp, 0);
+		power_off_ret = dw_dp_link_phy_power_off(dp);
+		if (power_off_ret) {
+			dev_err(dp->dev, "link PHY power off failed: %d\n", power_off_ret);
+			return power_off_ret;
+		}
+
+		if (attempt == DPTX_LINK_TRAINING_MAX_ATTEMPTS)
+			break;
+
+		dev_warn(dp->dev, "link enable attempt %u failed: %d, retrying\n",
+			 attempt, ret);
+		usleep_range(1000, 2000);
 	}
 
-	return 0;
+	return ret;
 }
 
 static void dw_dp_bridge_atomic_enable(struct drm_bridge *bridge,
@@ -4464,10 +4544,51 @@ static void dw_dp_bridge_atomic_enable(struct drm_bridge *bridge,
 	dw_dp_audio_handle_plugged_change(dp->audio, true);
 }
 
+static bool dw_dp_bridge_keep_sink_powered(struct drm_bridge *bridge,
+					   struct drm_atomic_state *state)
+{
+	struct dw_dp *dp = bridge_to_dp(bridge);
+	struct drm_connector *old_connector, *new_connector;
+	struct drm_connector_state *old_conn_state, *new_conn_state;
+	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
+
+	if (dp->panel || dp->is_mst || dp->split_mode || dp->dual_connector_split)
+		return false;
+
+	old_connector = drm_atomic_get_old_connector_for_encoder(state, bridge->encoder);
+	new_connector = drm_atomic_get_new_connector_for_encoder(state, bridge->encoder);
+	if (!old_connector || old_connector != new_connector)
+		return false;
+
+	old_conn_state = drm_atomic_get_old_connector_state(state, old_connector);
+	new_conn_state = drm_atomic_get_new_connector_state(state, new_connector);
+	if (!old_conn_state || !new_conn_state || !old_conn_state->crtc ||
+	    old_conn_state->crtc != new_conn_state->crtc ||
+	    old_conn_state->best_encoder != bridge->encoder ||
+	    new_conn_state->best_encoder != bridge->encoder)
+		return false;
+
+	old_crtc_state = drm_atomic_get_old_crtc_state(state, old_conn_state->crtc);
+	new_crtc_state = drm_atomic_get_new_crtc_state(state, new_conn_state->crtc);
+	if (!old_crtc_state || !new_crtc_state ||
+	    !old_crtc_state->enable || !old_crtc_state->active ||
+	    !new_crtc_state->enable || !new_crtc_state->active ||
+	    old_crtc_state->self_refresh_active || new_crtc_state->self_refresh_active)
+		return false;
+
+	/* Avoid an unnecessary D3/D0 cycle during a temporary modeset. */
+	return dw_dp_detect(dp);
+}
+
 static void dw_dp_bridge_atomic_disable(struct drm_bridge *bridge,
 					struct drm_bridge_state *old_bridge_state)
 {
 	struct dw_dp *dp = bridge_to_dp(bridge);
+	bool keep_sink_powered;
+
+	keep_sink_powered = dw_dp_bridge_keep_sink_powered(bridge, old_bridge_state->base.state);
+	dev_info(dp->dev, "SST disable: sink power policy %s\n",
+		 keep_sink_powered ? "keep D0 for active modeset" : "D3 on link disable");
 
 	if (dp->panel)
 		drm_panel_disable(dp->panel);
@@ -4475,7 +4596,7 @@ static void dw_dp_bridge_atomic_disable(struct drm_bridge *bridge,
 	dw_dp_enable_vop_gate(dp, bridge->encoder->crtc, dp->id, false);
 	dw_dp_hdcp_disable(dp);
 	dw_dp_video_disable(dp, 0);
-	dw_dp_link_disable(dp);
+	dw_dp_link_disable(dp, !keep_sink_powered);
 	bitmap_zero(dp->sdp_reg_bank, SDP_REG_BANK_SIZE);
 
 	extcon_set_state_sync(dp->audio->extcon, EXTCON_DISP_DP, false);
@@ -5025,7 +5146,11 @@ static void dw_dp_hpd_work(struct work_struct *work)
 	dev_dbg(dp->dev, "got hpd irq - %s\n", long_hpd ? "long" : "short");
 
 	if (!long_hpd) {
-		phy_power_on(dp->phy);
+		ret = phy_power_on(dp->phy);
+		if (ret) {
+			dev_warn(dp->dev, "HPD PHY power on failed: %d\n", ret);
+			return;
+		}
 		if (dp->is_mst) {
 			dw_dp_check_mst_status(dp);
 			phy_power_off(dp->phy);
